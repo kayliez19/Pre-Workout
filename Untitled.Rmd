@@ -313,3 +313,250 @@ print(p_Q31)
 
 ```
 
+```{r}
+
+yn_questions <- c("Q25_1", "Q25_2", "Q25_3" , "Q25_4", "Q25_5", "Q25_6", "Q26", "Q31")  # <-- edit as needed
+
+
+```
+
+
+```{r}
+
+yn_summary <- df_long %>%
+  filter(question %in% yn_questions,
+         score_num %in% c(1, 2)) %>%
+  mutate(response = ifelse(score_num == 1, "Yes", "No")) %>%
+  count(question, PRODUCT, response) %>%
+  group_by(question, PRODUCT) %>%
+  mutate(
+    percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+print(yn_summary)
+
+
+```
+
+```{r}
+
+yn_wide <- yn_summary %>%
+  select(question, PRODUCT, response, percent) %>%
+  pivot_wider(
+    names_from = c(PRODUCT, response),
+    values_from = percent,
+    names_sep = "_"
+  )
+
+print(yn_wide)
+
+
+
+```
+
+```{r}
+
+p_yes <- yn_summary %>%
+  filter(response == "Yes") %>%
+  ggplot(aes(x = question, y = percent, fill = PRODUCT)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = product_colors) +
+  labs(
+    title = "Percent of participants answering 'Yes'",
+    x = "Question",
+    y = "Percent (%)",
+    fill = "PRODUCT"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_yes)
+
+
+```
+
+```{r}
+
+mcnemar_results <- df_long %>%
+  filter(question %in% yn_questions,
+         score_num %in% c(1, 2)) %>%
+  group_by(question) %>%
+  group_modify(~{
+    dat <- .x %>%
+      select(SubjectID, PRODUCT, score_num) %>%
+      pivot_wider(names_from = PRODUCT, values_from = score_num) %>%
+      filter(complete.cases(.))
+
+    tab <- table(dat[[prod_A]], dat[[prod_B]])
+
+    if (all(dim(tab) == c(2, 2))) {
+      test <- mcnemar.test(tab, correct = TRUE)
+      tibble(p_value = test$p.value)
+    } else {
+      tibble(p_value = NA_real_)
+    }
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj_fdr = p.adjust(p_value, method = "fdr"))
+
+print(mcnemar_results)
+
+
+```
+
+```{r}
+
+# Build annotation for Q26 only
+p_annot_Q26_Q31 <- mcnemar_results %>%
+  filter(question %in% c("Q26", "Q31")) %>%
+  mutate(
+    label = case_when(
+      p_adj_fdr < 0.001 ~ "***",
+      p_adj_fdr < 0.01  ~ "**",
+      p_adj_fdr < 0.05  ~ "*",
+      TRUE              ~ ""
+    ),
+    label = paste0(label, "\n", "p = ", signif(p_value, 2))
+  ) %>%
+  left_join(
+    yn_summary %>%
+      filter(question %in% c("Q26", "Q31"), response == "Yes") %>%
+      group_by(question) %>%
+      summarise(y_pos = max(percent) + 6, .groups = "drop"),
+    by = "question"
+  )
+
+```
+
+```{r}
+
+question_labels <- c(
+   Q25_1 = "Physically prepared\nat start of workout",
+   Q25_2 = "Motivated at the start of workout",
+   Q25_3 = "Energized during workout",
+   Q25_4 = "Felt 'in the zone' during workout",
+   Q25_5 = "Sustained endurance during workout",
+   Q25_6 = "Stronger during workout",
+   Q26     = "Experienced jitters",
+   Q31  = "Impacted sleep"
+)
+
+
+
+```
+
+
+
+
+```{r}
+
+p_yes <- yn_summary %>%
+  filter(response == "Yes") %>%
+  ggplot(aes(x = question, y = percent, fill = PRODUCT)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_text(
+    aes(label = paste0(round(percent, 1), "%")),
+    position = position_dodge(width = 0.7),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = product_colors) +
+  scale_y_continuous(limits = c(0, 105), labels = function(x) paste0(x, "%")) +
+geom_text(
+  data = p_annot_Q26_Q31,
+  aes(x = question, y = y_pos, label = label),
+  inherit.aes = FALSE,
+  size = 4
+) +
+   labs(
+    title = "Percent of participants answering 'Yes'",
+    x = "Question",
+    y = "Percent (%)",
+    fill = "PRODUCT"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_yes)
+
+```
+
+```{r}
+
+yn_summary <- df_long %>%
+  filter(question %in% yn_questions,
+         score_num %in% c(1, 2)) %>%
+  mutate(response = ifelse(score_num == 1, "Yes", "No")) %>%
+  count(question, PRODUCT, response, name = "n") %>%
+  group_by(question, PRODUCT) %>%
+  mutate(
+    N = sum(n),
+    percent = 100 * n / N
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+
+
+p_yes <- yn_summary %>%
+  filter(response == "Yes") %>%
+  mutate(bar_label = paste0(round(percent, 1), "%")) %>%
+  ggplot(aes(x = question, y = percent, fill = PRODUCT)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_text(
+    aes(label = bar_label),
+    position = position_dodge(width = 0.7),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  geom_text(
+    data = p_annot_Q26_Q31,
+    aes(x = question, y = y_pos, label = label),
+    inherit.aes = FALSE,
+    size = 4
+  ) +
+  scale_fill_manual(values = product_colors) +
+  scale_x_discrete(labels = question_labels) +
+  scale_y_continuous(limits = c(0, 115), labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Percent of participants answering 'Yes'",
+    x = NULL,
+    y = "Percent (%)",
+    fill = "PRODUCT"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(t = 10, r = 10, b = 40, l = 10)
+  )
+
+print(p_yes)
+
+
+```
+
+```{r}
+
+ggsave("figure-pre_work.svg", counts, device = "svg")
+
+ggsave("figure1-counts.tiff", plot = counts,
+       dpi = 600,         # High resolution
+       width = 10, height = 5,  # Adjust size (in inches)
+       units = "in",
+       compression = "lzw",    # Required by many journals
+       device = "tiff")
+
+
+```
+
