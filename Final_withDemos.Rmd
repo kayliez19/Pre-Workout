@@ -1,0 +1,783 @@
+---
+title: "pre-workout"
+author: "Kaylie Zapanta"
+date: "2026-01-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+# =========================
+# Likert (ordinal) group comparison + plots
+# =========================
+
+# Packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(forcats)
+library(broom)
+library(readxl)
+library(scales)
+
+```
+
+#Load Data
+```{r}
+
+df <- read_excel("~/Desktop/df_preworkout.xlsx")
+
+```
+
+
+```{r}
+
+# -------------------------
+# 1) Settings: ID column + PRODUCT + question columns
+# -------------------------
+id_col <- "SubjectID"   # <-- change if your subject identifier column has a different name
+group_col <- "PRODUCT"
+
+# Option A: explicitly list your 15 items (recommended)
+question_cols <- c(
+  "Q1",	"Q2",	"Q3",	"Q4",	"Q5",	"Q21", "Q25_1",	"Q25_2",	"Q25_3",	"Q25_4",	"Q25_5",	"Q25_6",	"Q26",	"Q27",	"Q28", "Q31"
+)
+
+```
+
+
+# -------------------------
+# 2) Basic checks
+# -------------------------
+```{r}
+if (!all(c(id_col, group_col) %in% names(df))) {
+  stop(paste0("Missing required column(s). Need: ", id_col, " and ", group_col))
+}
+
+missing_q <- setdiff(question_cols, names(df))
+if (length(missing_q) > 0) {
+  stop(paste0("These question columns were not found in your data: ", paste(missing_q, collapse = ", ")))
+}
+
+df2 <- df %>%
+  mutate(
+    SubjectID = as.factor(.data[[id_col]]),
+    PRODUCT   = as.factor(.data[[group_col]])
+  ) %>%
+  filter(!is.na(SubjectID), !is.na(PRODUCT))
+if (nlevels(df2$PRODUCT) != 2) {
+  stop("PRODUCT must have exactly 2 levels for this script (crossover with two products).")
+}
+
+
+```
+
+
+# -------------------------
+# 3) Reshape long + parse Likert scores
+#    Handles numeric (1,2,3) and strings like '1- never'
+# -------------------------
+```{r}
+
+
+df_long <- df2 %>%
+  pivot_longer(cols = all_of(question_cols), names_to = "question", values_to = "raw") %>%
+  mutate(
+    score_num = suppressWarnings(as.numeric(raw)),
+    score_num = ifelse(
+      is.na(score_num),
+      suppressWarnings(as.numeric(str_extract(as.character(raw), "^[0-9]+"))),
+      score_num
+    )
+  ) %>%
+  filter(!is.na(score_num))
+
+# Shared Likert levels for consistent plotting across questions
+likert_levels <- sort(unique(df_long$score_num))
+df_long <- df_long %>%
+  mutate(score = factor(score_num, levels = likert_levels, ordered = TRUE))
+
+
+```
+
+# -------------------------
+# 4) Paired tests per question (Wilcoxon signed-rank)
+#    Requires each SubjectID has responses for BOTH products for a given question
+# -------------------------
+# Rank-biserial correlation for paired signed-rank:
+# r_rb = (2*V)/(n*(n+1)) - 1, where V is sum of positive ranks and n is # non-zero diffs
+
+```{r}
+
+rank_biserial_paired <- function(xA, xB) {
+  d <- xA - xB
+  d <- d[!is.na(d)]
+  d <- d[d != 0]
+  n <- length(d)
+  if (n < 1) return(NA_real_)
+  r <- rank(abs(d))
+  V <- sum(r[d > 0])
+  (2 * V) / (n * (n + 1)) - 1
+}
+
+prod_levels <- levels(df_long$PRODUCT)
+prod_A <- prod_levels[1]
+prod_B <- prod_levels[2]
+
+paired_results <- df_long %>%
+  select(SubjectID, PRODUCT, question, score_num) %>%
+  group_by(question) %>%
+  group_modify(~{
+    dat_w <- .x %>%
+      pivot_wider(names_from = PRODUCT, values_from = score_num)
+
+    # complete pairs only
+    dat_w <- dat_w %>% filter(complete.cases(.))
+
+    if (nrow(dat_w) < 2) {
+      return(tibble(
+        n_pairs = nrow(dat_w),
+        median_diff_A_minus_B = NA_real_,
+        p_value = NA_real_,
+        rank_biserial = NA_real_
+      ))
+    }
+    xA <- dat_w[[prod_A]]
+    xB <- dat_w[[prod_B]]
+
+    wt <- wilcox.test(xA, xB, paired = TRUE, exact = FALSE)
+
+    tibble(
+      n_pairs = nrow(dat_w),
+      median_diff_A_minus_B = median(xA - xB, na.rm = TRUE),
+      p_value = wt$p.value,
+      rank_biserial = rank_biserial_paired(xA, xB)
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj_fdr = p.adjust(p_value, method = "fdr")) %>%
+  arrange(p_value)
+
+print(paired_results)
+
+
+```
+
+# -------------------------
+# 6) Plot B: Colored faceted boxplots + jitter + p-value stars (paired tests)
+# -------------------------
+```{r}
+# Define PRODUCT colors (auto-assign to your two level names)
+product_colors <- setNames(c("#1F77B4", "#E45756"), prod_levels)
+
+# Build labels (stars based on FDR; show raw p)
+annot_df <- paired_results %>%
+  mutate(
+    sig = case_when(
+      p_adj_fdr < 0.001 ~ "***",
+      p_adj_fdr < 0.01  ~ "**",
+      p_adj_fdr < 0.05  ~ "*",
+      TRUE              ~ ""
+    ),
+    label = ifelse(
+      is.na(p_value), "",
+      ifelse(sig == "",
+             paste0("p = ", signif(p_value, 2)),
+             paste0(sig, "\n", "p = ", signif(p_value, 2)))
+    )
+  ) %>%
+  select(question, label) %>%
+  left_join(
+    df_long %>%
+      group_by(question) %>%
+      summarise(y_pos = max(score_num, na.rm = TRUE) + 0.5, .groups = "drop"),
+    by = "question"
+  )
+
+p_box <- ggplot(df_long, aes(x = PRODUCT, y = score_num, fill = PRODUCT, color = PRODUCT)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, alpha = 0.35, size = 1.6) +
+  facet_wrap(~question, ncol = 5, scales = "free_y") +
+  geom_text(
+    data = annot_df,
+    aes(x = 1.5, y = y_pos, label = label),
+    inherit.aes = FALSE,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = product_colors) +
+  scale_color_manual(values = product_colors) +
+  labs(
+    title = "Likert scores by PRODUCT (crossover; paired analysis)",
+    subtitle = "* indicates FDR-adjusted p < 0.05; label shows raw paired Wilcoxon p-value",
+    x = "PRODUCT",
+    y = "Likert score",
+    fill = "PRODUCT",
+    color = "PRODUCT"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+print(p_box)
+
+```
+```{r}
+
+# ============================================================
+# Pull significant questions (Q13, Q14) and make separate
+# colored boxplots with paired-test significance labels
+# Assumes you already ran the full script and have:
+#   df_long, paired_results, product_colors, prod_levels
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+
+sig_qs <- c("Q26", "Q31")
+
+custom_titles <- c(
+  Q26 = "Q26. Experienced Jitters/Other Sensations?",
+  Q31 = "Q31. Q31. Was Sleep Impacted?"
+)
+
+# Build per-question annotation (stars based on FDR; show raw paired p)
+annot_2q <- paired_results %>%
+  filter(question %in% sig_qs) %>%
+  mutate(
+    sig = case_when(
+      p_adj_fdr < 0.001 ~ "***",
+      p_adj_fdr < 0.01  ~ "**",
+      p_adj_fdr < 0.05  ~ "*",
+      TRUE              ~ ""
+    ),
+    label = paste0(sig, "\n", "p = ", signif(p_value, 2))
+  ) %>%
+  select(question, label) %>%
+  left_join(
+    df_long %>%
+      filter(question %in% sig_qs) %>%
+      group_by(question) %>%
+      summarise(y_pos = max(score_num, na.rm = TRUE) + 0.5, .groups = "drop"),
+    by = "question"
+  )
+
+# Data for just Q13 and Q14
+df_2q <- df_long %>% filter(question %in% sig_qs)
+
+# Function to make one plot per question
+plot_one_question <- function(q) {
+  ann <- annot_2q %>% filter(question == q)
+  ggplot(df_2q %>% filter(question == q),
+         aes(x = PRODUCT, y = score_num, fill = PRODUCT, color = PRODUCT)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    geom_jitter(width = 0.15, alpha = 0.35, size = 1.8) +
+    geom_text(
+      data = ann,
+      aes(x = 1.5, y = y_pos, label = label),
+      inherit.aes = FALSE,
+      size = 4
+    ) +
+    scale_fill_manual(values = product_colors) +
+    scale_color_manual(values = product_colors) +
+    labs(
+      title = paste0(q, " (paired crossover)"),
+      subtitle = "* indicates FDR-adjusted p < 0.05; label shows raw paired p-value",
+      x = "",
+      y = "Likert score",
+      fill = "PRODUCT",
+      color = "PRODUCT"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "top",
+      panel.grid.minor = element_blank()
+    )
+}
+
+p_Q26 <- plot_one_question("Q26")
+p_Q31 <- plot_one_question("Q31")
+
+print(p_Q26)
+print(p_Q31)
+
+# Optional: save
+# ggsave("Q13_boxplot_significance.png", p_Q13, width = 6, height = 5, dpi = 300)
+# ggsave("Q14_boxplot_significance.png", p_Q14, width = 6, height = 5, dpi = 300)
+
+
+
+```
+
+```{r}
+
+yn_questions <- c("Q25_1", "Q25_2", "Q25_3" , "Q25_4", "Q25_5", "Q25_6", "Q26", "Q31")  # <-- edit as needed
+
+
+```
+
+
+```{r}
+
+yn_summary <- df_long %>%
+  filter(question %in% yn_questions,
+         score_num %in% c(1, 2)) %>%
+  mutate(response = ifelse(score_num == 1, "Yes", "No")) %>%
+  count(question, PRODUCT, response) %>%
+  group_by(question, PRODUCT) %>%
+  mutate(
+    percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+print(yn_summary)
+
+
+```
+
+```{r}
+
+yn_wide <- yn_summary %>%
+  select(question, PRODUCT, response, percent) %>%
+  pivot_wider(
+    names_from = c(PRODUCT, response),
+    values_from = percent,
+    names_sep = "_"
+  )
+
+print(yn_wide)
+
+
+
+```
+
+```{r}
+
+p_yes <- yn_summary %>%
+  filter(response == "Yes") %>%
+  ggplot(aes(x = question, y = percent, fill = PRODUCT)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = product_colors) +
+  labs(
+    title = "Percent of participants answering 'Yes'",
+    x = "Question",
+    y = "Percent (%)",
+    fill = "PRODUCT"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_yes)
+
+
+```
+
+```{r}
+
+mcnemar_results <- df_long %>%
+  filter(question %in% yn_questions,
+         score_num %in% c(1, 2)) %>%
+  group_by(question) %>%
+  group_modify(~{
+    dat <- .x %>%
+      select(SubjectID, PRODUCT, score_num) %>%
+      pivot_wider(names_from = PRODUCT, values_from = score_num) %>%
+      filter(complete.cases(.))
+
+    tab <- table(dat[[prod_A]], dat[[prod_B]])
+
+    if (all(dim(tab) == c(2, 2))) {
+      test <- mcnemar.test(tab, correct = TRUE)
+      tibble(p_value = test$p.value)
+    } else {
+      tibble(p_value = NA_real_)
+    }
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj_fdr = p.adjust(p_value, method = "fdr"))
+
+print(mcnemar_results)
+
+
+```
+
+```{r}
+
+p_annot_Q26_Q31 <- mcnemar_results %>%
+  filter(question %in% c("Q26", "Q31")) %>%
+  mutate(
+    stars = case_when(
+      p_adj_fdr < 0.001 ~ "***",
+      p_adj_fdr < 0.01  ~ "**",
+      p_adj_fdr < 0.05  ~ "*",
+      TRUE              ~ ""
+    ),
+    label = paste0(stars, "\n", "p = ", signif(p_value, 2))
+  ) %>%
+  left_join(
+    yn_summary %>%
+      filter(question %in% c("Q26", "Q31"), response == "Yes") %>%
+      group_by(question) %>%
+      summarise(
+        max_yes = max(percent, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "question"
+  ) %>%
+  mutate(
+    y_pos = pmin(max_yes + 14, 112)  # push higher; cap so it stays inside axis
+  )
+
+
+```
+
+```{r}
+
+question_labels <- c(
+   Q25_1 = "Physically prepared\nat start of workout",
+   Q25_2 = "Motivated at\nstart of workout",
+   Q25_3 = "Energized during workout",
+   Q25_4 = "Felt 'in the zone' during workout",
+   Q25_5 = "Sustained endurance\nduring workout",
+   Q25_6 = "Stronger during workout",
+   Q26     = "Experienced jitters",
+   Q31  = "Impacted sleep"
+)
+
+
+
+```
+
+
+
+
+```{r}
+
+p_yes <- yn_summary %>%
+  filter(response == "Yes") %>%
+  ggplot(aes(x = question, y = percent, fill = PRODUCT)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_text(
+    aes(label = paste0(round(percent, 1), "%")),
+    position = position_dodge(width = 0.7),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = product_colors) +
+  scale_y_continuous(limits = c(0, 105), labels = function(x) paste0(x, "%")) +
+geom_text(
+  data = p_annot_Q26_Q31,
+  aes(x = question, y = y_pos, label = label),
+  inherit.aes = FALSE,
+  size = 4
+) +
+   labs(
+    title = "Percent of participants answering 'Yes'",
+    x = "Question",
+    y = "Percent (%)",
+    fill = "PRODUCT"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_yes)
+
+```
+
+```{r}
+
+yn_summary <- df_long %>%
+  filter(question %in% yn_questions,
+         score_num %in% c(1, 2)) %>%
+  mutate(response = ifelse(score_num == 1, "Yes", "No")) %>%
+  count(question, PRODUCT, response, name = "n") %>%
+  group_by(question, PRODUCT) %>%
+  mutate(
+    N = sum(n),
+    percent = 100 * n / N
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+
+
+p_yes <- yn_summary %>%
+  filter(response == "Yes") %>%
+  mutate(bar_label = paste0(round(percent, 1), "%")) %>%
+  ggplot(aes(x = question, y = percent, fill = PRODUCT)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_text(
+    aes(label = bar_label),
+    position = position_dodge(width = 0.7),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  geom_text(
+    data = p_annot_Q26_Q31,
+    aes(x = question, y = y_pos, label = label),
+    inherit.aes = FALSE,
+    size = 4
+  ) +
+  scale_fill_manual(values = product_colors) +
+  scale_x_discrete(labels = question_labels) +
+  scale_y_continuous(limits = c(0, 115), labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Percent of participants answering 'Yes'",
+    x = NULL,
+    y = "Percent (%)",
+    fill = "PRODUCT",
+    caption = "Binary outcomes were compared using paired McNemar’s tests to account for the crossover design.\nP-values were adjusted for multiple comparisons using the false discovery rate (FDR)."
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(t = 10, r = 10, b = 40, l = 10)
+  )
+
+print(p_yes)
+
+
+```
+
+```{r}
+
+p_yes <- p_yes +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(
+  "figure-pre_work.tiff",
+  plot = p_yes,
+  dpi = 600,                  # High resolution
+  width = 15,
+  height = 8,
+  units = "in",
+  compression = "lzw",        # Journal requirement
+  device = "tiff",
+  bg = "white"                # ⭐ THIS is critical
+)
+
+
+
+```
+
+```{r}
+
+
+# ============================================================
+# DESCRIPTIVE PIE CHARTS (ALL QUESTIONS COMBINED)
+# - No statistics
+# - Percent of each response option
+# - One export-ready TIFF
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# -------------------------
+# 1) Define questions to visualize
+# -------------------------
+extra_questions <- c("Q2", "Q3", "Q4", "Q5", "Q21")
+
+# Optional: nicer question labels (edit as needed)
+question_labels_extra <- c(
+  Q2 = "Time of Day Consumed",
+  Q3 = "Type of Workout",
+  Q4 = "Length of Exercise Session",
+  Q5 = "Overall Experience",
+  Q21 = "Would Consume Again"
+)
+
+```
+
+```{r}
+
+# ============================================================
+# 5 SEPARATE PIE CHARTS (one per question)
+# - Each chart shows 2 pies (one per PRODUCT group) via facet_wrap(~PRODUCT)
+# - Legend text is customizable per question (e.g., 1 = Morning, 2 = Mid-day)
+# - Descriptive only: % of each response option
+# - Exports 5 separate TIFFs (journal-ready) with white background
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+
+# -------------------------
+# 1) Choose the 5 questions
+# -------------------------
+extra_questions <- c("Q2", "Q3", "Q4", "Q5", "Q21")  # <-- edit
+
+# -------------------------
+# 2) OPTIONAL: nicer plot titles per question
+# -------------------------
+question_titles <- c(
+  Q2 = "Consumed product: time of day",
+  Q3 = "Type of Workout",
+  Q4 = "Length of exercise session",
+  Q5 = "Overall Experience (Yes/No)",
+  Q21 = "Would Consume Again (Yes/No)"
+)
+
+
+# -------------------------
+# 3) CUSTOM LEGEND TEXT PER QUESTION (EDIT THESE!)
+#    Each entry is a named character vector:
+#      names = numeric codes as strings ("1","2","3"...)
+#      values = what you want shown in the legend
+# -------------------------
+response_key <- list(
+  Q2 = c("1" = "Morning", "2" = "Afternoon", "3" = "Evening"),
+  Q3 = c("1" = "Strength Training", "2" = "Balance Exercise (e.g., yoga)", "3" = "Endurance Exercise"), 
+  Q4 = c("1" = "<15 min", "2" = "16-30min", "3" = "3-45min", "4" = "46-60min", "5" = "61-90min", "6" = ">90min"), # example (edit!)
+  Q5 = c("1" = "Yes", "2" = "No"), # example 1–6
+  Q21 = c("1" = "Yes", "2" = "No")                                    # binary
+)
+
+```
+
+
+
+
+```{r}
+
+# -------------------------
+# 4) GLOBAL COLOR MAP (DO NOT CHANGE)
+#    Color-blind safe, no blue/red
+# -------------------------
+response_colors <- c(
+  "1" = "#009E73",  # green
+  "2" = "#E69F00",  # orange
+  "3" = "#CC79A7",  # purple
+  "4" = "#0072B2",  # teal-ish (not blue-blue)
+  "5" = "#F0E442",  # yellow
+  "6" = "maroon"   # gray
+)
+
+# -------------------------
+# 5) Function to make one pie chart
+# -------------------------
+make_pie_for_question <- function(df_long, q, key_map, title_map) {
+
+  codes <- names(key_map)
+
+  pie_dat <- df_long %>%
+    filter(question == q) %>%
+    mutate(code = as.character(score_num)) %>%
+    filter(code %in% codes) %>%
+    mutate(
+      response = factor(code, levels = codes, labels = unname(key_map))
+    ) %>%
+    count(PRODUCT, response, code, name = "n") %>%
+    group_by(PRODUCT) %>%
+    mutate(
+      percent = 100 * n / sum(n),
+      label = paste0(round(percent, 1), "%")
+    ) %>%
+    ungroup()
+
+  plot_title <- title_map[[q]]
+
+  ggplot(pie_dat, aes(x = "", y = percent, fill = code)) +
+    geom_col(width = 1, color = "white") +
+    coord_polar(theta = "y") +
+    facet_wrap(~PRODUCT, ncol = 2) +
+    geom_text(
+      aes(label = ifelse(percent < 5, "", label)),
+      position = position_stack(vjust = 0.5),
+      size = 4
+    ) +
+    scale_fill_manual(
+      values = response_colors,
+      breaks = codes,
+      labels = unname(key_map),
+      drop = FALSE
+    ) +
+    labs(
+      title = plot_title,
+      fill = "Response"
+    ) +
+    theme_void(base_size = 14) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      legend.position = "right",
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      plot.margin = margin(10, 10, 10, 10)
+    )
+}
+
+# -------------------------
+# 6) Generate & export all 5 pies
+# -------------------------
+for (q in extra_questions) {
+
+  p <- make_pie_for_question(
+    df_long = df_long,
+    q = q,
+    key_map = response_key[[q]],
+    title_map = question_titles
+  )
+
+  print(p)
+
+  ggsave(
+    filename = paste0("pie_", q, ".tiff"),
+    plot = p,
+    dpi = 600,
+    width = 7,
+    height = 4.5,
+    units = "in",
+    compression = "lzw",
+    device = "tiff",
+    bg = "white"
+  )
+}
+
+
+```
+
+
+```{r}
+
+for (q in extra_questions) {
+
+  p <- make_pie_for_question(
+    df_long = df_long,
+    q = q,
+    key_map = response_key[[q]],
+    title_map = question_titles
+  )
+
+  ggsave(
+    filename = paste0("pie_", q, ".tiff"),
+    plot = p,
+    dpi = 600,
+    width = 7,
+    height = 4.5,
+    units = "in",
+    compression = "lzw",
+    device = "tiff",
+    bg = "white"
+  )
+}
+
+
+```
